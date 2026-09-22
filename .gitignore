@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.ekf/
+workspace/
+test-results/
+node_modules/
+.env
+.env.*
+!.env.example
