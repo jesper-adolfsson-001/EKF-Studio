@@ -37,7 +37,7 @@ export function createLinkController({getSnapshot, modal, esc, api, onSaved, for
       const a=artifacts.get(update.id);
       if(a) artifacts.set(a.id,{...a,hash:update.expected_hash});
     }
-    session={artifact, artifacts, original, changes:initial, editor, onApply, direction,
+    session={project:snapshot.root,workspace:snapshot.workflow?.context,artifact, artifacts, original, changes:initial, editor, onApply, direction,
       selected:new Set(), page:0, managePage:0, tab:manage?'manage':'add', busy:false,
       parent:[...$('#overlay').childNodes], focus:document.activeElement};
     const types=[...new Set([...snapshot.relation_types,...Object.keys(descriptions)])].sort();
@@ -157,7 +157,7 @@ export function createLinkController({getSnapshot, modal, esc, api, onSaved, for
       s.busy=true;
       // Freeze the dialog during the transaction; Escape cannot discard a save in flight.
       $('#overlay').querySelectorAll('input,select,button').forEach(e=>e.disabled=true);
-      try {await api('links',{updates:pending});}
+      try {if(getSnapshot().root!==s.project)throw new Error('The active project changed. Reopen the link editor before saving.');await api('links',{workspace:s.workspace,updates:pending});}
       catch(error) {s.busy=false;$('#overlay').querySelectorAll('input,select,button').forEach(e=>e.disabled=false);render();throw error;}
       close(true);await onSaved(s.artifact.id);return;
     }

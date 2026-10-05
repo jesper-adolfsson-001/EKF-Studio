@@ -12,7 +12,10 @@ module.exports=async({page,context,base,repo})=>{
   const seed=spawnSync('python3',['-c',`import json,sys
 from ekf.core import Repository,serialize
 repo=Repository(sys.argv[1])
-repo.save_many([{'path': 'engineering/link-tests/'+a['id']+'.md', 'raw':serialize(a,'Picker pagination fixture.')} for a in json.load(sys.stdin)])`,repo],{
+repo.save_many([{'path': 'engineering/link-tests/'+a['id']+'.md', 'raw':serialize(a,'Picker pagination fixture.')} for a in json.load(sys.stdin)])
+identity=repo.workflow.active
+repo.workflow.update(identity)
+repo.decide(identity,'approve')`,repo],{
     input:JSON.stringify(Array.from({length:65},(_,i)=>({ekf:'0.1',id:'LINK-'+String(i).padStart(3,'0'),type:'link-test',title:'Link test item '+i,discipline:'Integration',custom:{keep:true},relations:i===0?[{type:'implemented-by',resource:'tools/analyze_shutdown.py',custom:'preserve'}]:[]}))),encoding:'utf8'});
   assert.equal(seed.status,0,seed.stderr);
   await page.goto(base+'/#knowledge');
@@ -20,6 +23,7 @@ repo.save_many([{'path': 'engineering/link-tests/'+a['id']+'.md', 'raw':serializ
   await page.getByRole('button',{name:'New artifact',exact:true}).click();
   await page.locator('#edit-id').fill('LINK-NEW');
   await page.locator('#edit-title').fill('A draft with incoming links');
+  await page.getByRole('button',{name:'Markdown source',exact:true}).click();
   await page.locator('#edit-body').fill('Keep my unsaved engineering meaning.');
   await page.locator('[data-action="editor-links"][data-direction="incoming"]').click();
   await expect(page.locator('#link-direction')).toHaveValue('incoming');
@@ -62,6 +66,7 @@ repo.save_many([{'path': 'engineering/link-tests/'+a['id']+'.md', 'raw':serializ
   const created=await artifact('LINK-NEW');
   assert.ok(created.body.includes('Keep my unsaved'));
   for(const id of ['LINK-000','LINK-020','LINK-064'])assert.ok((await artifact(id)).meta.relations.some(r=>r.type==='custom-supports'&&r.target==='LINK-NEW'));
+  repo=(await snapshot()).workflow.working_root;
   const commits=spawnSync('git',['-C',repo,'rev-list','--count',beforeCreate+'..HEAD'],{encoding:'utf8'});
   assert.equal(commits.stdout.trim(),'1');
 

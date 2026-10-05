@@ -7,6 +7,8 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ekf-browser-'));
 const repo = path.join(temp, 'repository');
+const projectsFolder = path.join(temp,'projects');
+const projectSuite = process.env.EKF_BROWSER_SUITE === 'projects';
 const port = Number(process.env.EKF_TEST_PORT || 8842);
 const base = `http://127.0.0.1:${port}`;
 const cwd = path.resolve(__dirname, '..');
@@ -15,9 +17,8 @@ const errors = [];
 const log = message => console.log(message);
 
 (async () => {
-  const init = spawnSync('python3', ['-m', 'ekf', 'init', repo, '--demo'], { cwd, encoding: 'utf8' });
-  assert.equal(init.status, 0, init.stderr);
-  server = spawn('python3', ['-m', 'ekf', 'serve', '--repo', repo, '--port', String(port)], { cwd, env: {...process.env, EKF_HOST_SECRET: 'must-not-enter-sandbox'}, stdio: ['ignore', 'pipe', 'pipe'] });
+  if(!projectSuite){const init = spawnSync('python3', ['-m', 'ekf', 'init', repo, '--demo'], { cwd, encoding: 'utf8' });assert.equal(init.status, 0, init.stderr);}
+  server = spawn('python3', projectSuite?['tests/project_server.py',projectsFolder,String(port)]:['-m', 'ekf', 'serve', '--repo', repo, '--port', String(port)], { cwd, env: {...process.env, EKF_HOST_SECRET: 'must-not-enter-sandbox'}, stdio: ['ignore', 'pipe', 'pipe'] });
   await new Promise((resolve,reject) => {
     const timeout = setTimeout(() => reject(new Error('Server startup timed out')), 10000);
     server.stdout.on('data', data => {if(data.toString().includes('EKF Studio:')){clearTimeout(timeout);resolve();}});
@@ -29,17 +30,27 @@ const log = message => console.log(message);
   const page = await context.newPage();
   page.on('pageerror', error => errors.push(error.message));
   page.on('response', async response => {if(response.status() >= 400) console.error('HTTP',response.status(),response.url(),await response.text().catch(()=>''));});
-  const humanKey=fs.readFileSync(path.join(repo,'.ekf/human-token'),'utf8').trim();
+  const humanKey=fs.readFileSync(path.join(projectSuite?projectsFolder:repo,'.ekf/human-token'),'utf8').trim();
   await page.goto(base+'/?access='+encodeURIComponent(humanKey));
+  if(projectSuite){await require('./browser_projects.cjs')({page,context,base,temp,projectsFolder});assert.deepEqual(errors,[]);return;}
   await expect(page.getByRole('heading',{name:'Engineering, connected.'})).toBeVisible();
   await page.screenshot({path:'/tmp/ekf-studio-overview.png',fullPage:true,animations:'disabled'});
   log('Overview rendered; screenshot captured.');
-  for(const name of ['knowledge','traceability','verification','reports','agent','changes','activity','settings']){
+  if(process.env.EKF_BROWSER_SUITE==='markdown'){
+    await require('./browser_markdown.cjs')({page,context,base,repo});
+    assert.deepEqual(errors,[]);return;
+  }
+  if(process.env.EKF_BROWSER_SUITE==='workflow'){
+    await require('./browser_workflow.cjs')({page,context,base,repo});
+    assert.deepEqual(errors,[]);return;
+  }
+  const workingRoot=async()=>((await (await context.request.get(base+'/api/snapshot')).json()).workflow?.working_root)||repo;
+  for(const name of ['knowledge','traceability','verification','reports','agent','changes','activity','settings','help']){
     await page.locator(`.nav-item[data-page="${name}"]`).click();
     await expect(page.locator('h1')).toBeVisible();
     assert.equal(await page.locator('body').evaluate(el=>el.scrollWidth>innerWidth),false,`Overflow on ${name}`);
   }
-  log('All nine navigation screens rendered.');
+  log('All ten navigation screens rendered.');
   await page.locator('.nav-item[data-page="knowledge"]').click();
   await page.getByRole('button',{name:'New artifact',exact:true}).click();
   await page.locator('#edit-id').fill('REQ-MECH-099');
@@ -47,6 +58,7 @@ const log = message => console.log(message);
   await page.locator('#edit-type').selectOption({label:'Add custom type…'});
   await page.locator('#edit-type-custom').fill('manufacturing-requirement');
   await page.locator('#edit-discipline').selectOption('Mechanical');
+  await page.getByRole('button',{name:'Markdown source',exact:true}).click();
   await page.locator('#edit-body').fill('## Statement\n\nShaft diameter shall be 20 ± 0.02 mm.\n\n## Acceptance criteria\n\nMeasure using a calibrated micrometer.\n\n<script>window.injected = true</script>');
   await page.locator('.modal summary').filter({hasText:'Additional metadata'}).click();
   await page.locator('#edit-extra').fill('{"tolerance_mm":0.02,"custom":{"owner":"Mechanical team"}}');
@@ -68,6 +80,11 @@ const log = message => console.log(message);
   await expect(page.locator('.drawer')).toContainText('Potentially affected neighborhood');
   await page.keyboard.press('Escape');
   log('Create, edit, custom metadata, review, safe Markdown, search and impact passed.');
+  const initialDraft=(await (await context.request.get(base+'/api/snapshot')).json()).workflow.id;
+  await context.request.post(base+'/api/proposals/update',{data:{id:initialDraft}});
+  const initialMerge=await context.request.post(base+'/api/proposals/decide',{data:{id:initialDraft,decision:'approve'}});
+  assert.equal(initialMerge.status(),200,await initialMerge.text());
+  await page.reload();
   await page.locator('.nav-item[data-page="changes"]').click();
   await page.getByRole('button',{name:'New proposal',exact:true}).click();
   await page.locator('#proposal-title').fill('Add reusable engineering calculator');
@@ -75,6 +92,9 @@ const log = message => console.log(message);
   await page.getByRole('button',{name:'Create proposal',exact:true}).click();
   await expect(page.locator('.diff')).toContainText('print(250 - 191)');
   assert.equal(fs.existsSync(path.join(repo,'tools/margin.py')),false);
+  await page.getByRole('button',{name:'Bring in latest main',exact:true}).click();
+  await page.getByRole('button',{name:'Check proposal',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Approve & merge'})).toBeEnabled();
   await page.getByRole('button',{name:'Approve & merge'}).click();
   await expect(page.locator('.modal .badge.approved')).toBeVisible();
   assert.equal(fs.readFileSync(path.join(repo,'tools/margin.py'),'utf8'),'print(250 - 191)\n');
@@ -88,6 +108,9 @@ const log = message => console.log(message);
   await page.locator('#evidence-verification').selectOption('VER-SAFE-001');
   await page.getByRole('button',{name:'Propose evidence'}).click();
   await expect(page.locator('.diff')).toContainText('result: unassessed');
+  await page.getByRole('button',{name:'Bring in latest main',exact:true}).click();
+  await page.getByRole('button',{name:'Check proposal',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Approve & merge'})).toBeEnabled();
   await page.getByRole('button',{name:'Approve & merge'}).click();
   await expect(page.locator('.modal .badge.approved')).toBeVisible();
   await page.keyboard.press('Escape');
@@ -104,10 +127,12 @@ const log = message => console.log(message);
   await expect(page.locator('.baseline-tag')).toContainText(['browser-verified','example-v0.1']);
   await require('./browser_relations.cjs')({page,context,base});
   await require('./browser_graph_root.cjs')({page,context,base});
-  await require('./browser_baselines.cjs')({page,context,base,repo});
-  await require('./browser_link_editor.cjs')({page,context,base,repo});
-  await require('./browser_graph_child.cjs')({page,context,base,repo});
-  await require('./browser_artifact_identity.cjs')({page,context,base,repo});
+  await require('./browser_baselines.cjs')({page,context,base,repo:await workingRoot()});
+  await require('./browser_link_editor.cjs')({page,context,base,repo:await workingRoot()});
+  await require('./browser_graph_child.cjs')({page,context,base,repo:await workingRoot()});
+  await require('./browser_artifact_identity.cjs')({page,context,base,repo:await workingRoot()});
+  await require('./browser_markdown.cjs')({page,context,base,repo:await workingRoot()});
+  await require('./browser_workflow.cjs')({page,context,base,repo});
   await page.locator('.nav-item[data-page="reports"]').click();
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button',{name:/Traceability matrix/}).click();
@@ -127,6 +152,8 @@ const log = message => console.log(message);
   assert.equal((await agent.post('/api/artifact',{data:{}})).status(),403);
   assert.equal((await agent.post('/api/links',{data:{updates:[]}})).status(),403);
   assert.equal((await agent.post('/api/proposals/decide',{data:{}})).status(),403);
+  assert.equal((await agent.post('/api/proposals/update',{data:{}})).status(),403);
+  assert.equal((await agent.post('/api/proposals/check',{data:{}})).status(),403);
   const toolCall=async(name,args={})=>{const response=await agent.post('/api/tools/call',{data:{name,arguments:args}});assert.equal(response.status(),200,await response.text());return response.json();};
   const safety=await toolCall('run_tool',{command:`set -e\nprintf 'print(6 * 7)\\n' > /output/dynamic.py\npython3 /output/dynamic.py\npython3 tools/margin.py\npython3 - <<'PY'\nimport os, socket\nassert not os.path.exists('/home/jesper')\nassert os.environ.get('EKF_HOST_SECRET') is None\ntry:\n open('/workspace/forbidden.txt','w')\n raise AssertionError('Repository writable')\nexcept OSError:\n pass\ns = socket.socket(); s.settimeout(1)\nassert s.connect_ex(('127.0.0.1', ${port})) != 0\nprint('ISOLATION VERIFIED')\nPY`});
   let run;

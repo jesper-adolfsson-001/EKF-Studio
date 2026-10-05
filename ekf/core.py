@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import base64
+import binascii
 import difflib
 import hashlib
 import json
@@ -21,6 +23,8 @@ RELATIONS = ["derives-from", "refines", "depends-on", "allocated-to", "implement
              "verified-by", "validated-by", "mitigates", "interfaces-with", "supersedes", "produces"]
 IGNORED = {".git", ".ekf", ".venv", "node_modules", "__pycache__"}
 MAX_FILE = 2 * 1024 * 1024
+MAX_ASSET = 10 * 1024 * 1024
+MAX_ASSET_BATCH = 20 * 1024 * 1024
 
 
 class Problem(Exception):
@@ -85,6 +89,8 @@ def load_yaml(text):
 
 
 def parse_artifact(text, path=""):
+    if len(text.encode("utf-8")) > MAX_FILE:
+        raise ValueError("Artifacts must be at most 2 MB. Store attachments in the assets folder.")
     lines = text.lstrip("\ufeff").splitlines(keepends=True)
     if not lines or lines[0].strip() != "---":
         raise ValueError("An EKF artifact must start with YAML frontmatter (---)")
@@ -158,7 +164,7 @@ def scan_sources(sources, resource_exists):
     """Apply identical format and graph checks to working files and Git blobs."""
     artifacts, findings, identities = [], [], {}
     for rel, size, read in sources:
-        if Path(rel).suffix.lower() != ".md":
+        if Path(rel).suffix.lower() != ".md" or "assets" in Path(rel).parts[:-1]:
             continue
         try:
             if size > MAX_FILE:
@@ -225,6 +231,7 @@ def analyze(graph, head=""):
 class Repository:
     def __init__(self, root):
         self.root = Path(root).resolve()
+        self.project_root = self.root
         self.state = self.root / ".ekf"
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = threading.RLock()
@@ -240,11 +247,14 @@ class Repository:
         previous = exclude.read_text() if exclude.exists() else ""
         if "/.ekf/" not in previous.splitlines():
             exclude.write_text(previous + "\n/.ekf/\n")
+        from .workflow import ChangeWorkflow
+        self.workflow = ChangeWorkflow(self)
+        self.workflow.restore()
 
-    def git(self, *args, cwd=None, check=True):
+    def git(self, *args, cwd=None, check=True, errors="strict"):
         proc = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
                                "-c", "user.name=EKF Studio", "-c", "user.email=studio@localhost", *args],
-                              cwd=cwd or self.root, capture_output=True, text=True, encoding="utf-8", timeout=30)
+                              cwd=cwd or self.root, capture_output=True, text=True, encoding="utf-8", errors=errors, timeout=30)
         if proc.returncode and check:
             raise Problem(proc.stderr.strip() or "Git operation failed", 409)
         return proc.stdout
@@ -314,6 +324,76 @@ class Repository:
         if "\0" in content:
             raise Problem("This is a binary resource. Open it in its engineering tool.")
         return {"path": path, "content": content}
+
+    def asset(self, path, ref=""):
+        """Read attachment bytes from the same revision as their referencing Markdown."""
+        if ref:
+            if (not isinstance(path, str) or not path or "\\" in path or "\0" in path
+                    or path.startswith("/") or any(p.startswith(".") or p in IGNORED or not p for p in path.split("/"))):
+                raise Problem("Use a relative repository path without hidden directories")
+            entry = self.revision_tree(self.resolve_revision(ref)).get(path)
+            if not entry:
+                raise Problem("Attachment not found in this revision", 404)
+            if entry["size"] > MAX_ASSET:
+                raise Problem("Attachment exceeds the 10 MB limit", 413)
+            result = subprocess.run(["git", "cat-file", "blob", entry["oid"]], cwd=self.root,
+                                    capture_output=True, timeout=30)
+            if result.returncode:
+                raise Problem("Could not read the attachment", 404)
+            data = result.stdout
+        else:
+            target = safe_path(self.root, path)
+            if not target.is_file():
+                raise Problem("Attachment not found", 404)
+            if target.stat().st_size > MAX_ASSET:
+                raise Problem("Attachment exceeds the 10 MB limit", 413)
+            data = target.read_bytes()
+        mime = "application/octet-stream"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif data.startswith((b"GIF87a", b"GIF89a")):
+            mime = "image/gif"
+        elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            mime = "image/webp"
+        elif data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+            mime = "image/avif"
+        elif Path(path).suffix.lower() == ".svg" and b"<svg" in data[:4096].lower():
+            mime = "image/svg+xml"
+        return data, mime
+
+    def prepare_assets(self, artifact_path, uploads):
+        if not isinstance(uploads, list) or len(uploads) > 50:
+            raise Problem("Supply at most 50 attachments per save")
+        prepared, total, names = [], 0, set()
+        for upload in uploads:
+            if not isinstance(upload, dict):
+                raise Problem("Invalid attachment")
+            name, encoded = upload.get("name"), upload.get("content")
+            if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", name)
+                    or name.endswith(".") or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?", name)):
+                raise Problem("Use an attachment filename without directories or special characters")
+            if not isinstance(encoded, str) or len(encoded) > ((MAX_ASSET + 2) // 3) * 4:
+                raise Problem("Each attachment must be at most 10 MB", 413)
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                raise Problem("Invalid attachment encoding")
+            total += len(data)
+            if len(data) > MAX_ASSET or total > MAX_ASSET_BATCH:
+                raise Problem("Attachments must be at most 10 MB each and 20 MB per save", 413)
+            if name.casefold() in names:
+                raise Problem("Each attachment filename must be unique, including letter case")
+            names.add(name.casefold())
+            path = (Path(artifact_path).parent / "assets" / name).as_posix()
+            target = safe_path(self.root, path)
+            if target.parent.is_dir() and any(p.name.casefold() == name.casefold() and p.name != name for p in target.parent.iterdir()):
+                raise Problem("An attachment with this filename already exists. Choose another name.", 409)
+            if target.exists() and (not target.is_file() or target.stat().st_size != len(data) or target.read_bytes() != data):
+                raise Problem("An attachment with this filename already exists. Choose another name.", 409)
+            prepared.append((target, data, target.read_bytes() if target.exists() else None))
+        return prepared
 
     def file_index(self, ref=""):
         if ref:
@@ -392,7 +472,7 @@ class Repository:
         return {**graph, "validation": analyze(graph, head if not dirty else "uncommitted-working-tree"), "manifest": manifest,
                 "head": head, "branch": branch, "dirty": dirty, "readonly": readonly,
                 "types": list(dict.fromkeys(CORE_TYPES + [a["type"] for a in graph["artifacts"]])),
-                "relation_types": list(dict.fromkeys(RELATIONS + [e["type"] for e in graph["edges"]])), "root": str(self.root)}
+                "relation_types": list(dict.fromkeys(RELATIONS + [e["type"] for e in graph["edges"]])), "root": str(self.project_root), "workflow": None if readonly else self.workflow.context()}
 
     def artifact(self, identity, ref=""):
         graph = self.snapshot(ref) if ref else scan(self.root)
@@ -418,16 +498,17 @@ class Repository:
                 "edges": [e for e in graph["edges"] if e["source"] in seen and (e.get("target") in seen or e.get("resource"))],
                 "distances": distances, "note": "Potential impact through incoming and outgoing relationships; not a semantic conclusion."}
 
-    def save(self, path, raw, expected_hash=None, actor="human:local"):
-        return self.save_many([{"path": path, "raw": raw, "expected_hash": expected_hash}], actor)[0]
+    def save(self, path, raw, expected_hash=None, actor="human:local", assets=None):
+        return self.save_many([{"path": path, "raw": raw, "expected_hash": expected_hash, "assets": [] if assets is None else assets}], actor)[0]
 
     def save_many(self, changes, actor="human:local"):
         """Validate the complete change before writing; commit or restore every file together."""
         with self.lock:
             if not self.clean():
                 raise Problem("Repository has external changes. Commit or discard them with Git before saving in Studio.", 409)
+            validated_head = self.head()
             existing = scan(self.root)
-            prepared, paths, identities = [], set(), {}
+            prepared, attachments, paths, identities = [], [], set(), {}
             for a in existing["artifacts"]:
                 if a["id"] in identities:
                     raise Problem("Resolve duplicate artifact IDs before saving", 409)
@@ -440,6 +521,8 @@ class Repository:
                 paths.add(path)
                 if target.suffix.lower() != ".md":
                     raise Problem("Artifacts must be Markdown files")
+                if "assets" in Path(path).parts[:-1]:
+                    raise Problem("The assets folder is for attachments. Save the artifact outside it.")
                 proposed = parse_artifact(change["raw"], path)
                 if target.exists():
                     previous = parse_artifact(target.read_text(encoding="utf-8"), path)
@@ -453,20 +536,41 @@ class Repository:
                     raise Problem("This ID is already used by another artifact", 409)
                 identities[proposed["id"]] = path
                 prepared.append((target, proposed, target.read_bytes() if target.exists() else None))
+                for attachment in self.prepare_assets(path, change.get("assets", [])):
+                    asset_path = attachment[0].relative_to(self.root).as_posix()
+                    if asset_path in paths:
+                        raise Problem("Each attachment can only be saved once per change")
+                    paths.add(asset_path)
+                    attachments.append(attachment)
+            if sum(len(data) for _, data, _ in attachments) > MAX_ASSET_BATCH or len(attachments) > 50:
+                raise Problem("Save at most 50 attachments totalling 20 MB at once", 413)
             for _, proposed, _ in prepared:
                 if any(r.get("target") and r["target"] not in identities for r in proposed["meta"].get("relations", [])):
                     raise Problem("A relationship points to an unknown artifact")
+            # Validate against the visible branch first, then move the transaction to
+            # an isolated proposal on the first save from main.
+            old_root = self.root
+            if prepared:
+                self.workflow.ensure_draft("Update " + prepared[0][1]["title"])
+            if self.head() != validated_head or not self.clean():
+                raise Problem("The working branch changed while preparing this save. Reopen the editor; no changes were saved.", 409)
+            if self.root != old_root:
+                prepared = [(self.root / target.relative_to(old_root), proposed, old) for target, proposed, old in prepared]
+                attachments = [(self.root / target.relative_to(old_root), data, old) for target, data, old in attachments]
             try:
                 for target, proposed, _ in prepared:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(proposed["raw"], encoding="utf-8")
+                for target, data, _ in attachments:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
                 if paths:
                     self.git("add", "--", *sorted(paths))
                     if self.git("diff", "--cached", "--name-only").strip():
                         label = prepared[0][1]["id"] if len(prepared) == 1 else f"links across {len(prepared)} artifacts"
                         self.git("commit", "-m", f"{actor}: update {label}")
             except Exception:
-                for target, _, old in prepared:
+                for target, _, old in [*prepared, *attachments]:
                     if old is None:
                         target.unlink(missing_ok=True)
                     else:
@@ -474,6 +578,7 @@ class Repository:
                 if paths:
                     self.git("reset", "--", *sorted(paths), check=False)
                 raise
+            self.workflow.saved()
             return [a for _, a, _ in prepared]
 
     def save_links(self, updates, artifact=None):
@@ -592,9 +697,8 @@ class Repository:
             return {"name": name, "commit": self.head()}
 
     def proposals(self):
-        folder = self.state / "proposals"
-        folder.mkdir(exist_ok=True)
-        return sorted([json.loads(p.read_text()) for p in folder.glob("*.json")], key=lambda p: p["created"], reverse=True)
+        with self.lock:
+            return self.workflow.list()
 
     def propose(self, title, changes, actor="agent:external"):
         if not isinstance(title, str) or not title.strip() or len(title) > 200:
@@ -604,6 +708,7 @@ class Repository:
         with self.lock:
             if not self.clean():
                 raise Problem("Commit external repository changes before proposing a branch", 409)
+            self.workflow.require_main()
             base = self.head()
             identity = uuid.uuid4().hex[:12]
             branch = "change/" + re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:45] + "-" + identity[:6]
@@ -661,7 +766,7 @@ class Repository:
                 affected = set()
                 for aid in set(touched_ids):
                     if any(a["id"] == aid for a in original["artifacts"]):
-                        affected.update(a["id"] for a in self.impact(aid)["artifacts"])
+                        affected.add(aid)
                 proposal = {"id": identity, "title": title, "created": now(), "actor": actor, "status": "pending",
                             "base": base, "commit": commit, "branch": branch, "files": touched, "diff": diff,
                             "affected": sorted(affected), "findings": report["findings"],
@@ -670,27 +775,12 @@ class Repository:
                 folder = self.state / "proposals"
                 folder.mkdir(exist_ok=True)
                 (folder / f"{identity}.json").write_text(json.dumps(proposal, default=str, indent=2))
-                return proposal
+                return self.workflow.describe(proposal)
             finally:
                 self.git("worktree", "remove", "--force", str(worktree), check=False)
 
     def decide(self, identity, decision):
-        if decision not in ("approve", "reject"):
-            raise Problem("Choose approve or reject")
-        with self.lock:
-            proposal = next((p for p in self.proposals() if p["id"] == identity), None)
-            if not proposal or proposal["status"] != "pending":
-                raise Problem("Pending proposal not found", 404)
-            if decision == "approve":
-                if not self.clean() or self.head() != proposal["base"]:
-                    raise Problem("Repository changed since this proposal. Create an updated proposal against the current HEAD.", 409)
-                if self.git("rev-parse", proposal["branch"]).strip() != proposal["commit"]:
-                    raise Problem("Proposal branch changed after review", 409)
-                self.git("merge", "--no-ff", "-m", f"human:local: approve {proposal['title']}\n\nReviewed-commit: {proposal['commit']}\nProposal-branch: {proposal['branch']}", proposal["commit"])
-                proposal["merged_commit"] = self.head()
-            proposal.update(status="approved" if decision == "approve" else "rejected", reviewed_by="human:local", reviewed_at=now())
-            (self.state / "proposals" / f"{identity}.json").write_text(json.dumps(proposal, indent=2))
-            return proposal
+        return self.workflow.decide(identity, decision)
 
     def report(self, kind="traceability", ref=""):
         snap = self.snapshot(ref)

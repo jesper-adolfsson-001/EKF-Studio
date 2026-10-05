@@ -88,6 +88,7 @@ class RepoTests(unittest.TestCase):
         self.assertNotIn("Clarification.", self.repo.artifact(a["id"])["raw"])
         self.assertIn("REQ-SAFE-001", p["affected"])
         self.assertIn("agent:external", p["diff"])
+        self.repo.workflow.update(p["id"])
         self.repo.decide(p["id"], "approve")
         self.assertNotEqual(self.repo.head(), original)
         self.assertIn("human:local: approve", self.repo.history()[0]["message"])

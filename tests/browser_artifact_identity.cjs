@@ -29,6 +29,7 @@ module.exports=async({page,context,base,repo})=>{
   await page.locator('#edit-discipline').selectOption({label:'Add custom discipline…'});
   await page.locator('#edit-discipline-custom').fill('Integration & Test');
   await page.locator('#edit-title').fill('A child with a type-based ID');
+  await page.getByRole('button',{name:'Markdown source',exact:true}).click();
   await page.locator('#edit-body').fill('Preserve this meaning while IDs and selections change.');
   await page.locator('#child-link-direction').selectOption('parent-child');
   await page.locator('#child-relationship').fill('verified-by');

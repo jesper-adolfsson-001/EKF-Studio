@@ -38,6 +38,7 @@ module.exports=async({page,context,base,repo})=>{
   await menu.getByRole('menuitem',{name:'Create child…',exact:true}).click();
   await page.locator('#edit-id').fill('GRAPH-CHILD-001');
   await page.locator('#edit-title').fill('Refined shutdown requirement');
+  await page.getByRole('button',{name:'Markdown source',exact:true}).click();
   await page.locator('#edit-body').fill('A new requirement created from the overview graph.');
   await page.locator('#child-relationship').fill('');
   await create.click();
@@ -96,6 +97,7 @@ module.exports=async({page,context,base,repo})=>{
 
   // Baseline menu supports inspection but cannot create children.
   await page.locator('#workspace-revision').selectOption('browser-verified');
+  await expect(page.locator('.baseline-banner')).toContainText('browser-verified');
   await node().click({button:'right'});
   await expect(menu).toContainText('Baseline · read only');
   await expect(menu.getByRole('menuitem',{name:'Create child…',exact:true})).toHaveCount(0);

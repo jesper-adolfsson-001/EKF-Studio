@@ -5,12 +5,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import secrets
-from urllib.parse import parse_qs, urlparse
+import threading
+from urllib.parse import parse_qs, urlparse, quote
 
 import yaml
 
 from .core import Repository, Problem, safe_path, serialize, now, MAX_FILE
 from .runner import Runner
+from .projects import Projects, Jobs
+from .github import GitHub
 
 STATIC = Path(__file__).resolve().parent.parent / "web"
 
@@ -38,22 +41,55 @@ TOOLS = [
 
 
 class Application:
-    def __init__(self, repo):
-        self.repo = repo
-        self.runner = Runner(repo)
+    def __init__(self, repo=None, projects_folder=None):
+        self.lock = threading.RLock()
+        self.projects = Projects(projects_folder or (repo.project_root.parent if repo else Path.cwd()/'projects'), repo.project_root if repo else None)
+        self.jobs = Jobs()
+        self.github = GitHub(self.projects.state)
+        self.repo = None
+        self.runner = None
+        self.agent_token = ''
+        self.cache = {}
         self.session = secrets.token_urlsafe(32)
+        if repo:
+            self.activate(repo)
+        elif self.projects.data['selected']:
+            try: self.open_project(self.projects.data['selected'])
+            except (Problem,OSError,ValueError): self.projects.select(None)
+        human_path = (repo.state if repo else self.projects.state) / 'human-token'
+        self.launch_key = self.token(human_path)
+
+    @staticmethod
+    def token(path):
+        if not path.exists():
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd,'w') as stream: stream.write(secrets.token_urlsafe(32))
+        return path.read_text().strip()
+
+    def activate(self, repo):
+        identity = self.projects.register(repo.project_root)
+        if self.runner and self.runner.active.locked():
+            raise Problem('Wait for the current tool run to finish before switching projects.',409)
+        self.repo = repo
+        self.runner = self.cache[identity][1] if identity in self.cache else Runner(repo)
         token_path = repo.state / "agent-token"
-        if not token_path.exists():
-            fd = os.open(token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(secrets.token_urlsafe(32))
-        self.agent_token = token_path.read_text().strip()
-        human_path = repo.state / "human-token"
-        if not human_path.exists():
-            fd = os.open(human_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(secrets.token_urlsafe(32))
-        self.launch_key = human_path.read_text().strip()
+        self.agent_token = self.token(token_path)
+        self.cache[identity] = (repo,self.runner)
+        self.projects.select(identity)
+        return {'project':identity}
+
+    def open_project(self, identity):
+        if self.jobs.active: raise Problem('Wait for project setup to finish before switching projects.',409)
+        repo = self.cache[identity][0] if identity in self.cache else Repository(self.projects.root(identity))
+        return self.activate(repo)
+
+    def require_project(self):
+        if not self.repo: raise Problem('Create or open a project first.',409)
+
+    def project_context(self, identity):
+        current = self.projects.identity(self.repo.project_root) if self.repo else None
+        if identity is not None and identity != current:
+            raise Problem('The project changed in another tab. Refresh before continuing; no changes were saved.',409)
 
     def read_resource(self, path, ref=""):
         return self.repo.resource(path, ref)
@@ -84,6 +120,8 @@ class Application:
                 continue  # Binary/large outputs remain available in the local run directory.
             if dest != log_path:
                 changes.append({"path": dest, "content": content})
+        if actor == "human:local":
+            return self.repo.workflow.save_files(changes, title)
         return self.repo.propose(title, changes, actor)
 
     def call_tool(self, name, args, actor="agent:external"):
@@ -130,7 +168,7 @@ def make_handler(app):
             # Do not log request paths, tokens, or engineering content.
             pass
 
-        def send(self, payload, status=200, content_type="application/json; charset=utf-8", cookie=False, download=None):
+        def send(self, payload, status=200, content_type="application/json; charset=utf-8", cookie=False, download=None, attachment=False):
             if not isinstance(payload, bytes):
                 payload = (json.dumps(payload, default=str) if content_type.startswith("application/json") else payload).encode("utf-8")
             self.send_response(status)
@@ -139,11 +177,11 @@ def make_handler(app):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+            self.send_header("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'" if attachment else "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
             if cookie:
                 self.send_header("Set-Cookie", f"ekf_session={app.session}; Path=/; HttpOnly; SameSite=Strict")
             if download:
-                self.send_header("Content-Disposition", f'attachment; filename="{download}"')
+                self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(download, safe=""))
             self.end_headers()
             self.wfile.write(payload)
 
@@ -171,6 +209,10 @@ def make_handler(app):
             return "human:local"
 
         def do_GET(self):
+            with app.lock:
+                self.handle_get()
+
+        def handle_get(self):
             try:
                 self.guard()
                 parsed = urlparse(self.path)
@@ -181,10 +223,25 @@ def make_handler(app):
                     if access and not hmac.compare_digest(access, app.launch_key):
                         raise Problem("Invalid browser access key", 403)
                     return self.send((STATIC / "index.html").read_bytes(), content_type="text/html; charset=utf-8", cookie=bool(access))
-                if path in ("/app.js", "/links.js", "/style.css", "/favicon.svg"):
+                if path in ("/app.js", "/links.js", "/changes.js", "/projects.js", "/style.css", "/favicon.svg", "/dist/markdown.js", "/dist/markdown.css"):
                     mime = {".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}[Path(path).suffix]
                     return self.send((STATIC / path[1:]).read_bytes(), content_type=mime)
-                self.auth()
+                human_only=path.startswith(('/api/projects','/api/github','/api/setup-jobs'))
+                self.auth(human=human_only)
+                if path == "/api/help/workflow":
+                    return self.send({"markdown": (STATIC.parent / "docs" / "workflow-help.md").read_text(encoding="utf-8")})
+                if path == '/api/projects':
+                    return self.send({'projects':app.projects.list(),'folder':str(app.projects.folder),'selected':app.projects.data['selected'],'setup_job':app.jobs.active})
+                if path == '/api/setup-jobs': return self.send(app.jobs.get(get('id')))
+                if path == '/api/github/status': return self.send(app.github.status())
+                if path == '/api/github/repositories': return self.send(app.github.repositories(get('page',1)))
+                if path == '/api/github/owners': return self.send(app.github.owners())
+                if path == '/api/github/inspect': return self.send(app.github.inspect(get('repository')))
+                app.require_project()
+                app.project_context(self.headers.get('X-EKF-Project'))
+                if path == '/api/github/connection':
+                    name=app.github.remote(app.repo)
+                    return self.send({'repository':name,'url':'https://github.com/'+name if name else None,'main':app.repo.workflow.main,'commit':app.repo.workflow.main_head()})
                 if path == "/api/snapshot":
                     return self.send(app.repo.snapshot(get("ref")))
                 if path == "/api/artifact":
@@ -201,10 +258,16 @@ def make_handler(app):
                     return self.send({"history": app.repo.history(), "baselines": app.repo.baselines()})
                 if path == "/api/proposals":
                     return self.send(app.repo.proposals())
+                if path == "/api/proposals/conflict":
+                    return self.send(app.repo.workflow.conflict(get("id"), get("path")))
                 if path == "/api/runs":
                     return self.send(app.runner.get(get("id")) if get("id") else app.runner.list())
                 if path == "/api/resource":
                     return self.send(app.read_resource(get("path"), get("ref")))
+                if path == "/api/asset":
+                    data, mime = app.repo.asset(get("path"), get("ref"))
+                    return self.send(data, content_type=mime, attachment=True,
+                                     download=Path(get("path")).name if get("download") or not mime.startswith("image/") else None)
                 if path == "/api/output":
                     return self.send({"content": app.runner.output(get("id"), get("path"))})
                 if path == "/api/tools":
@@ -219,6 +282,10 @@ def make_handler(app):
                 self.send({"error": "The server could not complete this request. Check the repository and retry."}, 500)
 
         def do_POST(self):
+            with app.lock:
+                self.handle_post()
+
+        def handle_post(self):
             try:
                 self.guard()
                 path = urlparse(self.path).path
@@ -229,13 +296,63 @@ def make_handler(app):
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                     raise Problem("Content-Type must be application/json", 415)
                 size = int(self.headers.get("Content-Length", "0"))
-                if not 0 < size <= 4 * MAX_FILE:
-                    raise Problem("Request body must be between 1 byte and 8 MB", 413)
+                limit = 16 * MAX_FILE if path in ("/api/artifact", "/api/links") else 4 * MAX_FILE
+                if not 0 < size <= limit:
+                    raise Problem(f"Request body must be between 1 byte and {limit // (1024 * 1024)} MB", 413)
                 body = json.loads(self.rfile.read(size))
                 if not isinstance(body, dict):
                     raise Problem("Request body must be an object")
+                if path.startswith('/api/projects/') and app.jobs.active:
+                    raise Problem('Wait for project or GitHub setup to finish before changing projects.',409)
+                if path == '/api/projects/create':
+                    identity=app.projects.create(body['title'],body['folder'])
+                    return self.send(app.open_project(identity),201)
+                if path == '/api/projects/open':
+                    identity=body.get('id')
+                    if not identity:
+                        root=Path(body['path']).expanduser().resolve()
+                        if not (root/'ekf.yaml').is_file() or not (root/'.git').exists():
+                            raise Problem('Choose an existing EKF project folder containing ekf.yaml and its own Git repository.')
+                        repo=Repository(root)
+                        identity=app.projects.register(repo.project_root)
+                        return self.send(app.activate(repo))
+                    return self.send(app.open_project(identity))
+                if path == '/api/projects/forget':
+                    app.projects.forget(body['id']); return self.send({'removed':True})
+                if path == '/api/github/login': return self.send(app.jobs.start('Preparing GitHub sign-in…',app.github.sign_in),202)
+                if path == '/api/github/login/cancel': app.github.cancel_login(); return self.send({'cancelled':True})
+                if path == '/api/github/clone':
+                    return self.send(app.jobs.start('Downloading your GitHub project…',lambda progress:app.github.clone(app.projects,body['repository'],body['folder'])),202)
+                app.require_project()
+                app.project_context(body.get('project'))
+                app.repo.workflow.assert_context(body.get("workspace"))
+                if path in ('/api/github/publish','/api/github/connect'):
+                    repo=app.repo
+                    if body.get('expected_main')!=repo.workflow.main_head():
+                        raise Problem('The approved project changed. Reopen GitHub setup before uploading.',409)
+                    def transfer(progress):
+                        with repo.lock:
+                            if body.get('expected_main')!=repo.workflow.main_head(): raise Problem('The approved project changed. Reopen GitHub setup.',409)
+                            if path.endswith('/publish'):
+                                return app.github.publish(repo,body['owner'],body['name'],body['visibility'],body.get('description',''))
+                            return app.github.connect(repo,body['repository'],body.get('upload') is True)
+                    return self.send(app.jobs.start('Connecting your project to GitHub…',transfer),202)
+                if path == "/api/files":
+                    return self.send(app.repo.workflow.save_files(body["changes"], body.get("title", "Edit project files")))
+                if path == "/api/changes/start":
+                    return self.send(app.repo.workflow.start(body["title"]))
+                if path == "/api/changes/switch":
+                    return self.send(app.repo.workflow.switch(body.get("id")))
+                if path == "/api/proposals/rename":
+                    return self.send(app.repo.workflow.rename(body["id"], body["title"]))
+                if path == "/api/proposals/update":
+                    return self.send(app.repo.workflow.update(body["id"], body.get("run_checks", True)))
+                if path == "/api/proposals/check":
+                    return self.send(app.repo.workflow.check_proposal(body["id"]))
+                if path == "/api/proposals/resolve":
+                    return self.send(app.repo.workflow.resolve(body["id"], body["path"], body["choice"], body.get("content"), body.get("expected_commit"), body.get("expected_main")))
                 if path == "/api/artifact":
-                    return self.send(app.repo.save(body["path"], body["raw"], body.get("expected_hash")))
+                    return self.send(app.repo.save(body["path"], body["raw"], body.get("expected_hash"), assets=body.get("assets", [])))
                 if path == "/api/links":
                     return self.send(app.repo.save_links(body["updates"], body.get("artifact")))
                 if path == "/api/review":
@@ -243,7 +360,10 @@ def make_handler(app):
                 if path == "/api/baselines":
                     return self.send(app.repo.baseline(body["name"]))
                 if path == "/api/proposals":
-                    return self.send(app.repo.propose(body["title"], body["changes"], actor), 201)
+                    p = app.repo.propose(body["title"], body["changes"], actor)
+                    if actor == "human:local":
+                        app.repo.workflow.switch(p["id"])
+                    return self.send(p, 201)
                 if path == "/api/proposals/decide":
                     return self.send(app.repo.decide(body["id"], body["decision"]))
                 if path == "/api/runs":
@@ -262,10 +382,10 @@ def make_handler(app):
     return Handler
 
 
-def serve(repo, port=8840):
-    app = Application(repo)
+def serve(repo=None, port=8840, projects_folder=None):
+    app = Application(repo, projects_folder)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app))
-    print(f"EKF Studio: http://localhost:{server.server_port}/?access={app.launch_key}\nRepository: {repo.root}\nSandbox: {app.runner.reason}", flush=True)
+    print(f"EKF Studio: http://localhost:{server.server_port}/?access={app.launch_key}\nProjects: {app.projects.folder}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

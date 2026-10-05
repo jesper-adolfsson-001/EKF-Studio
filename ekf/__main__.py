@@ -15,9 +15,10 @@ def main():
     init.add_argument("--title", default="My engineering workspace")
     for name in ("serve", "validate", "report"):
         p = sub.add_parser(name)
-        p.add_argument("--repo", default="workspace")
+        p.add_argument("--repo", default=None if name=='serve' else 'workspace')
         if name == "serve":
             p.add_argument("--port", type=int, default=8840)
+            p.add_argument("--projects", help="Folder for local projects (defaults to projects, or the opened repository's parent)")
         if name == "report":
             p.add_argument("--kind", default="traceability", choices=["traceability", "verification", "requirements", "architecture", "safety", "review"])
     args = parser.parse_args()
@@ -37,10 +38,10 @@ def main():
             print(Repository(args.repo).report(args.kind))
         else:
             from .server import serve
-            root = Path(args.repo)
-            if not root.exists():
-                init_repo(root, demo=True)
-            serve(Repository(root), args.port)
+            root = Path(args.repo) if args.repo else None
+            if root and not root.exists():
+                raise Problem('Project folder not found. Start without --repo to create it from the project manager.')
+            serve(Repository(root) if root else None, args.port, args.projects)
     except (Problem, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

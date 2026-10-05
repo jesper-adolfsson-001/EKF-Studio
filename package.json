@@ -2,7 +2,24 @@
   "name": "ekf-studio",
   "version": "0.1.0",
   "private": true,
-  "description": "Browser test tooling only. The app has no Node runtime dependency.",
-  "scripts": {"test": "python3 -m unittest discover -s tests -v", "test:browser": "node tests/browser.cjs"},
-  "devDependencies": {"@playwright/test": "1.63.0"}
+  "description": "EKF Studio frontend build and browser tests. The app has no Node runtime dependency.",
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v",
+    "test:browser": "node tests/browser.cjs",
+    "build": "node scripts/build-editor.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "esbuild": "0.28.2"
+  },
+  "dependencies": {
+    "@lexical/react": "0.48.0",
+    "@lexical/utils": "0.48.0",
+    "@mdxeditor/editor": "4.3.1",
+    "dompurify": "3.4.16",
+    "lexical": "0.48.0",
+    "marked": "18.0.14",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
 }

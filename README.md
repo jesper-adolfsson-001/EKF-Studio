@@ -13,9 +13,27 @@ python3 -m pip install -r requirements.txt
 python3 -m ekf serve
 ```
 
-Open the **browser access link printed in the terminal** (at localhost:8840). The link authorizes this browser once; afterwards you can use http://localhost:8840 normally until the server restarts. The first run creates `workspace/`, a separate Git repository containing the example. Subsequent starts preserve your work.
+Open the **browser access link printed in the terminal** (at localhost:8840). The link authorizes this browser once; afterwards you can use http://localhost:8840 normally until the server restarts. On a fresh installation, **Projects** opens first. Create a project there; Studio creates its folder, files and separate Git repository. Subsequent starts reopen the last selected project.
 
-To start an empty project:
+## Local projects and GitHub
+
+Select **Projects** in the sidebar to create, open and switch projects. **New local project** asks for a project name and folder name. Each project has its own artifacts, assets, Git history, baselines and draft proposals. **Remove from list** keeps the files on your computer. **Open local folder** registers an existing EKF project without moving it; when the server runs in WSL, enter its WSL path.
+
+New projects are stored under `projects/` by default. Existing EKF repositories directly under that folder, such as `projects/Aster` and `projects/MyGarden`, appear automatically. Choose another container with `python3 -m ekf serve --projects /path/to/projects`. The former `workspace/` folder is optional; existing projects can be opened through **Open local folder** or `--repo`.
+
+From the active project's card or **Settings**, select **GitHub setup**:
+
+1. **Sign in to GitHub.** Studio uses the official GitHub CLI, downloading and checking the helper if needed. If an installed CLI is too old for Studio's sign-in flow, Studio downloads a compatible helper without changing that system installation. Copy the displayed code, select **Continue on GitHub**, authorize the connection and return to Studio.
+2. **Publish as a new repository** creates a repository in your account or organization. Choose **Private** (the default) or **Public** before selecting **Create repository & upload**. Public makes the uploaded files and history readable by anyone.
+3. **Choose existing repository** lists your repositories with pagination and a filter, or accepts a GitHub URL. An empty repository can receive your approved local main. A populated repository must share history with the local project; Studio refuses to combine unrelated projects.
+
+Alternatively, **Projects → Open from GitHub** downloads an existing EKF repository into a new local project folder and opens it. It does not overwrite an existing folder. If a transfer fails, the message explains how to retry; partial local files are retained. An ongoing setup can be reopened through **GitHub setup** or **View setup progress** after refreshing Projects.
+
+Publication uploads approved main and its history. Unapproved draft proposal branches remain local. GitHub setup does not yet submit proposals as pull requests, fetch remote main through the proposal buttons, or publish subsequent local approvals automatically. The current review and merge workflow remains local. Use the connected repository's GitHub link to manage collaborators.
+
+The project catalog and GitHub account configuration live under the projects container's hidden `.ekf/` folder. Each project also has excluded `.ekf/` runtime state. Studio refuses to upload main history containing that runtime directory. Agent tokens belong to individual projects: an MCP connection can access only its project while that project is selected in Studio. Reconfigure the MCP token path when moving to another project.
+
+Optional terminal setup for an empty project:
 
 ```bash
 python3 -m ekf init projects/my-system --title "My system"
@@ -28,7 +46,7 @@ To open an existing repository:
 python3 -m ekf serve --repo /absolute/path/to/engineering-repository
 ```
 
-The selected directory must be a Git repository root with at least one commit. The tool adds `/.ekf/` to its local Git exclude file for runtime state. It never imports engineering content into an authoritative database. Commit external edits using Git before saving or running tools in Studio. Refresh the browser view to pick up external changes.
+The selected directory must contain `ekf.yaml` and be a Git repository root with at least one commit. The tool adds `/.ekf/` to its local Git exclude file for runtime state. It never imports engineering content into an authoritative database. Commit external edits using Git before saving or running tools in Studio. Refresh the browser view to pick up external changes. To create the included synthetic example explicitly, run `python3 -m ekf init projects/example --demo`, then open it through Projects.
 
 ## Use the workspace
 
@@ -42,10 +60,43 @@ The selected directory must be a Git repository root with at least one commit. T
 - **Verification:** syntax and graph conformance, verification planning, evidence and advisory findings. Evidence and verification definitions remain distinct.
 - **Generated views:** requirements, architecture/interfaces, traceability, verification, safety and design review Markdown reports, stamped with their source Git revision.
 - **Agent workbench:** sandboxed shell execution, run history, output inspection and evidence proposals. Any installed CLI in the mounted runtime can be used; temporary Python or shell tools can be created in `/tmp` or `/output`.
-- **Change proposals:** actual Git branches with file diffs, relationship additions/removals, affected artifacts and advisory findings. A human approves a merge or rejects the proposal. An explicit merge commit records human approval in Git. Stale proposals must be regenerated against the new HEAD.
+- **Change proposals:** actual Git branches with file diffs, relationship additions/removals, affected artifacts and advisory findings. A human approves a merge or rejects the proposal. An explicit merge commit records human approval in Git. Proposals must incorporate the latest main and pass current checks before approval.
 - **History & baselines:** real Git commit history and annotated Git tags. Browse saved versions read-only and compare baselines with each other or the current workspace. Existing baselines remain immutable.
 
-Save creates a Git commit with a `human:local` message. Agent edits happen on separate branches. Git hooks and commit signing are disabled for application-generated operations so opening a repository does not execute its hooks. Git's normal CLI remains available for branches, comparisons, remote pull requests and rollback.
+Save creates a Git commit with a `human:local` message on a proposal branch. The first save from main creates that branch automatically; subsequent edits accumulate in the same proposal. Main changes only after approval. Agent proposals also use separate branches. Git hooks and commit signing are disabled for application-generated operations so opening a repository does not execute its hooks. Git's normal CLI remains available for branches, comparisons, remote pull requests and rollback.
+
+## Work on a change proposal
+
+1. Open an artifact on **main** and edit it. The editor explains that your first save creates a branch and proposal. You can also select the workspace name at the top left and choose **Start a new change** to name one before editing.
+2. The top-left workspace control and a persistent banner show the active proposal. Artifact edits, new items, links, images/files, human review records and manifest edits accumulate there. Saves create commits on that branch; the approved files in the main project folder stay unchanged.
+3. Choose **Review proposal** to inspect the accumulated file diff, relationship changes and validation findings. Rename the proposal there if needed. Use **Continue editing** to return to the library.
+4. Select **Bring in latest main**. Studio merges main **into the proposal branch**, leaving main unchanged. If files conflict, select **Resolve** and keep the proposal version, keep the main version, or edit the complete resolved text. Binary conflicts offer a choice of versions. Resolving the last conflict finishes this update; approval still requires a separate check.
+5. Expand **Last update from main** to inspect its file changes, then choose **Inspect updated branch** to review the combined requirements, links and evidence in the library. Make further edits if needed. Select **Check proposal** when ready; this checks your branch without silently merging more changes. If main has advanced, bring it in first.
+6. **Approve & merge** merges **the proposal branch into main**. It becomes available only when the branch contains the current main, has saved changes, is clean, and passes checks against those exact main/proposal commits. Further edits or main commits invalidate those checks. Approval records a merge commit with both parent commits; the Git ref transaction verifies and locks both branch tips while main is updated.
+7. **Reject** archives the proposal and retains its branch and working folder. Its changes do not enter main.
+
+Open **Help** in the sidebar or **Workflow help** in a proposal for the [plain-language workflow guide](docs/workflow-help.md), including a requirements example, the two merge directions, conflicts and baselines.
+
+The workspace control lets you switch between **main · Approved state** and open proposals. Switching preserves other drafts, and the active proposal survives a server restart. This is a single-user selection shared by the running Studio instance; stale browser drafts are rejected when their branch context has changed. Accounts, roles and concurrent multiuser sessions are not implemented.
+
+Each proposal has an isolated Git worktree in `<project>/.ekf/worktrees/<proposal-id>/`. **Workspace settings → Working files** shows the active folder. Relative Markdown assets stay beside their Markdown files inside that worktree and arrive in the main folder on approval. Keep the project's hidden `.git` and `.ekf` directories when backing it up; pending proposal records and worktrees need both. After moving a project containing worktrees, use Git's `worktree repair` to repair their paths.
+
+Checks cover EKF syntax, IDs and relationship targets, the manifest, and missing local `assets/` references in Markdown images/links. Engineering advisories remain visible and do not become proof of engineering correctness. A clean textual merge can still fail validation—for example, if two branches introduce the same stable ID. External uncommitted changes block saving or merging in the affected folder; Studio does not discard them.
+
+**New proposal** remains available for explicit batches of file changes. Agent proposals are based on the currently selected working state and remain separate for review. Baselines capture the currently selected branch commit, including draft branches; they remain immutable after approval or rejection. Main is local: update it from your remote with Git before checking a proposal when remote collaboration is involved.
+
+## Markdown, images and attachments
+
+The item editor uses [MDXEditor](https://mdxeditor.dev/editor/docs/images) for rich text, headings, lists, links, tables and code blocks. Switch to **Markdown source** for direct editing. Content that the rich editor cannot parse opens in source mode with its original text preserved.
+
+- Use **Add image** to upload images, or the image toolbar to insert an image URL. Images can also be pasted or dropped into rich text.
+- Use the controls below an image to choose **Left**, **Center** or **Right**, edit its description, and set width/height in pixels. Click the image to reveal drag handles. Leave one dimension blank to preserve proportions; **Reset size** restores its natural size.
+- Use **Attach file** for PDFs, documents, spreadsheets and other files. The viewer displays images and offers file links for download.
+- Uploads stay in the draft until **Save artifact**. The item, its new files and any pending link changes are committed together. Cancel discards pending uploads. Each file can be up to **10 MB**, with **20 MB / 50 files** per save.
+
+For `engineering/requirements/item.md`, uploads are stored in `engineering/requirements/assets/`. Generated filenames avoid collisions; Markdown uses relative references such as `![Diagram](assets/diagram-abc123.png)` and `[Specification](assets/specification-abc123.pdf)`. Sized/aligned images use ordinary HTML `<img>` tags with width/height attributes and `ekf-image-left`, `ekf-image-center` or `ekf-image-right` classes. Studio styles these classes in both editor and viewer; other Markdown tools may need equivalent CSS. Images are constrained to the available viewing width.
+
+Existing relative image/file references resolve from the Markdown file's directory. Baseline views load repository attachments from the same Git revision as the item. External image URLs continue to point to their external source. Files in an `assets` folder are attachments, so attached Markdown documents are excluded from the artifact index. Removing a reference leaves previously committed files available to other items and old baselines; new uploads removed from the draft are not saved.
 
 ## Browse and compare baselines
 
@@ -114,7 +165,7 @@ Persistent agent-created tools can be proposed under `tools/`. Give important me
 
 ### Example: connect OpenAI Codex
 
-Run Codex and EKF Studio on the same machine/environment. The examples below use this checkout at `/home/jesper/web-apps/ekf-tool-001` and its default `workspace/` repository. Replace those paths, the Python executable and the port if your setup differs.
+Run Codex and EKF Studio on the same machine/environment. The examples below use this checkout at `/home/jesper/web-apps/ekf-tool-001` and an existing `workspace/` repository. Replace that repository path with your selected project, such as `projects/MyGarden`, and adjust the Python executable and port as needed.
 
 **1. Start EKF Studio and leave it running.**
 
@@ -208,12 +259,12 @@ Validation exits 1 for syntax, identity or unresolved-target errors, and 0 when 
 The browser test creates an isolated temporary Git repository, starts a local server, uses a real browser and executes real Bubblewrap analyses:
 
 ```bash
-npm install
+npm ci
 npx playwright install --with-deps chromium
 npm run test:browser
 ```
 
-`EKF_CHROMIUM` may select an existing Chromium executable; `EKF_PLAYWRIGHT` may select an existing Playwright package. `EKF_TEST_PORT` defaults to 8842. Screenshots are written to `/tmp/ekf-studio-overview.png` and `/tmp/ekf-studio-mobile.png`.
+`EKF_CHROMIUM` may select an existing Chromium executable; `EKF_PLAYWRIGHT` may select an existing Playwright package. `EKF_TEST_PORT` defaults to 8842. Screenshots include `/tmp/ekf-studio-overview.png`, `/tmp/ekf-studio-mobile.png` and `/tmp/ekf-proposal-review.png`. Set `EKF_BROWSER_SUITE=workflow` to run the focused proposal workflow checks.
 
 See [the implementation/conformance map](docs/conformance.md) for coverage against the supplied EKF draft.
 
@@ -224,10 +275,12 @@ This is a local, single-user application bound to loopback. It does not provide 
 ## Implementation
 
 - `ekf/core.py`: YAML artifacts, reproducible graph, conformance, impact, Git changes/baselines and reports.
+- `ekf/workflow.py`: isolated proposal worktrees, accumulated changes, conflict resolution and merge checks tied to exact commits.
 - `ekf/runner.py`: Bubblewrap execution and reproducibility records.
 - `ekf/server.py`: loopback HTTP API, human session/agent capability separation and static assets.
 - `ekf/mcp.py`: stdio MCP bridge.
-- `web/`: dependency-free browser interface, with escaped content and restrictive security headers.
+- `web/`: browser interface and bundled Markdown editor/viewer, with sanitized Markdown rendering and restrictive security headers.
+- `frontend/`: React island for MDXEditor, attachment staging and Markdown rendering. Run `npm ci` then `npm run build` after changing these sources; commit the generated `web/dist/` files with the source. Bundles are included, so running Studio still requires no Node installation or external CDN.
 - `tests/`: format, repository, execution and full browser workflow verification.
 
 References: [Bubblewrap's security model](https://github.com/containers/bubblewrap#sandbox-security), [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
